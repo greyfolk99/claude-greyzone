@@ -44,12 +44,21 @@ const DEFAULT_WORK_DIR = '/home/seo';
 
 export default function App() {
   const {
+    tabs,
+    activeTabId,
+    setActiveTabId,
+    createTab,
+    deleteTab,
+    setTabSession,
     serverState,
     setServerState,
     messageCache,
     setMessages,
     sessionMetadata,
     setSessionMetadata,
+    getSessionState,
+    isSessionOpen,
+    findTabBySession,
   } = useChatStore();
 
   // URL-based tab routing
@@ -86,15 +95,16 @@ export default function App() {
     return queueByTabRef.current.get(tabId) || [];
   }, []);
 
-  // Derive values from server state
-  const tabs = serverState.tabs;
-  const activeTabId = serverState.activeTabId;
+  // Derive values from store
   const activeTab = useMemo(() => tabs.find((t) => t.id === activeTabId), [tabs, activeTabId]);
 
-  // Get messages from cache
+  // Get session state from server (for loading/processId)
   const sessionId = activeTab?.sessionId || '';
+  const sessionState = getSessionState(sessionId);
+  const isLoading = sessionState?.isLoading || false;
+
+  // Get messages from cache
   const cachedMessages = useMemo(() => messageCache.get(sessionId) || [], [messageCache, sessionId]);
-  const isLoading = activeTab?.isLoading || false;
 
   // Ref for isLoading to avoid closure issues in handleSendMessage
   const isLoadingRef = useRef(false);
@@ -154,7 +164,6 @@ export default function App() {
   const queuedMessages = activeTabId ? (queueByTab.get(activeTabId) || []) : [];
 
   // Combine cached messages with streaming content for display
-  // Note: Don't use useMemo here - we need immediate re-renders when streaming state changes
   // Order: cached → pending user → queued users → streaming response
   const messages: Message[] = (() => {
     const result = [...cachedMessages];
@@ -208,38 +217,18 @@ export default function App() {
   // Track if initial sync is done
   const initialSyncDoneRef = useRef(false);
 
-  // Subscribe to server state on mount and restore tabs from localStorage
+  // Subscribe to server state on mount (session processing status)
   useEffect(() => {
     const initState = async () => {
       try {
         // Get current server state
         const state = await serverApi.getState();
         setServerState(state);
-        console.log('[App] Initial state loaded, tabs:', state.tabs.length);
-
-        // Check if we need to restore tabs from localStorage
-        // This happens when server was restarted and has only the default empty tab
-        const savedTabs = localStorageApi.loadOpenTabs();
-        if (savedTabs.length > 0 && state.tabs.length === 1 && !state.tabs[0].sessionId) {
-          console.log('[App] Restoring tabs from localStorage:', savedTabs.length);
-          // Restore saved sessions to tabs
-          for (const saved of savedTabs) {
-            if (saved.sessionId) {
-              // Create a new tab for this session
-              const newTab = await serverApi.createTab();
-              await serverApi.setTabSession(newTab.id, saved.sessionId);
-            }
-          }
-          // Delete the initial empty tab if we restored at least one session
-          if (savedTabs.some(t => t.sessionId)) {
-            await serverApi.deleteTab(state.tabs[0].id);
-          }
-        }
-
-        // Initial URL sync after state is loaded
+        console.log('[App] Initial state loaded');
         initialSyncDoneRef.current = true;
       } catch (error) {
         console.error('[App] Failed to initialize state:', error);
+        initialSyncDoneRef.current = true;
       }
     };
 
@@ -248,13 +237,6 @@ export default function App() {
     const unsubscribe = serverApi.subscribe(
       (state) => {
         setServerState(state);
-        // Save tabs to localStorage whenever state changes
-        const tabsToSave = state.tabs
-          .filter(t => t.sessionId)
-          .map(t => ({ id: t.id, sessionId: t.sessionId }));
-        if (tabsToSave.length > 0) {
-          localStorageApi.saveOpenTabs(tabsToSave);
-        }
       },
       (err) => console.error('State subscription error:', err)
     );
@@ -269,10 +251,10 @@ export default function App() {
     if (urlTabIndex !== null && urlTabIndex >= 0 && urlTabIndex < tabs.length) {
       const targetTab = tabs[urlTabIndex];
       if (targetTab && targetTab.id !== activeTabId) {
-        serverApi.setActiveTab(targetTab.id);
+        setActiveTabId(targetTab.id);
       }
     }
-  }, [urlTabIndex, tabs, activeTabId]);
+  }, [urlTabIndex, tabs, activeTabId, setActiveTabId]);
 
   // Sync active tab with URL (Tab -> URL)
   useEffect(() => {
@@ -365,12 +347,11 @@ export default function App() {
   useEffect(() => {
     const checkDirtyTabs = async () => {
       // Get all inactive tabs with sessions
-      const inactiveTabs = tabs.filter(t =>
-        t.id !== activeTabId &&
-        t.sessionId &&
-        !t.isLoading &&
-        sessionMtimeRef.current.has(t.sessionId)
-      );
+      const inactiveTabs = tabs.filter(t => {
+        if (t.id === activeTabId || !t.sessionId) return false;
+        const sessionState = getSessionState(t.sessionId);
+        return !sessionState?.isLoading && sessionMtimeRef.current.has(t.sessionId);
+      });
 
       if (inactiveTabs.length === 0) return;
 
@@ -404,7 +385,7 @@ export default function App() {
     // Check every 10 seconds
     const interval = setInterval(checkDirtyTabs, 10000);
     return () => clearInterval(interval);
-  }, [tabs, activeTabId, setMessages]);
+  }, [tabs, activeTabId, setMessages, getSessionState]);
 
   // Update showWelcome when tab changes
   useEffect(() => {
@@ -442,12 +423,13 @@ export default function App() {
     if (!activeTab) return;
 
     const targetTabId = activeTab.id;
+    const targetSessionId = activeTab.sessionId;
 
     // Check if there's already a pending message or loading - add to queue
     // Use refs to get latest values (avoids closure issues)
     const currentIsLoading = isLoadingRef.current;
     const pending = hasPendingMessage(targetTabId);
-    console.log('[handleSendMessage] isLoading:', currentIsLoading, 'hasPending:', pending, 'ref value:', streamingStateByTabRef.current.get(targetTabId));
+    console.log('[handleSendMessage] isLoading:', currentIsLoading, 'hasPending:', pending);
     if (currentIsLoading || pending) {
       console.log('[handleSendMessage] -> going to queue');
       flushSync(() => {
@@ -456,8 +438,6 @@ export default function App() {
       return;
     }
     console.log('[handleSendMessage] -> going to pending');
-
-    const targetSessionId = activeTab.sessionId;
 
     // Force synchronous render so user sees their message immediately
     flushSync(() => {
@@ -474,7 +454,6 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          tabId: targetTabId,
           prompt: text,
           sessionId: targetSessionId || undefined,
           workDir: targetSessionId ? undefined : workDir,
@@ -506,8 +485,8 @@ export default function App() {
             if (data.type === 'system' && data.subtype === 'init' && !targetSessionId) {
               currentSessionId = data.session_id;
               if (currentSessionId) {
-                // Set session on tab
-                await serverApi.setTabSession(targetTabId, currentSessionId);
+                // Update tab with new session ID
+                setTabSession(targetTabId, currentSessionId);
                 // Set metadata for new session and save workDir to localStorage
                 setSessionMetadata(currentSessionId, { workDir });
                 localStorageApi.saveLastWorkDir(workDir);
@@ -587,7 +566,7 @@ export default function App() {
       // Clear streaming state on error
       clearStreamingState(targetTabId);
     }
-  }, [activeTab, workDir, setMessages, addToQueue, getQueueLatest, clearQueue, setSessionMetadata, setPendingUserMessage, setStreamingContent, clearStreamingState, hasPendingMessage]);
+  }, [activeTab, workDir, setMessages, addToQueue, getQueueLatest, clearQueue, setSessionMetadata, setTabSession, setPendingUserMessage, setStreamingContent, clearStreamingState, hasPendingMessage]);
 
   // Clear queue handler
   const handleClearQueue = useCallback(() => {
@@ -597,33 +576,29 @@ export default function App() {
   }, [activeTabId, clearQueue]);
 
   // Tab handlers
-  const handleAddTab = useCallback(async () => {
-    const newTab = await serverApi.createTab();
+  const handleAddTab = useCallback(() => {
+    const newTab = createTab();
     // New tab will be at the end, update URL to point to it
     const newIndex = tabs.length; // Current length = new index after adding
     setUrlTabIndex(newIndex, false);
-    // Set the new tab as active
-    if (newTab) {
-      serverApi.setActiveTab(newTab.id);
-    }
     setShowWelcome(true);
-  }, [tabs.length, setUrlTabIndex]);
+  }, [tabs.length, setUrlTabIndex, createTab]);
 
   const handleCloseTab = useCallback((tabId: string) => {
     const tab = tabs.find(t => t.id === tabId);
     if (tab && messageCache.has(tab.sessionId)) {
       setTabToClose(tabId);
     } else {
-      serverApi.deleteTab(tabId);
+      deleteTab(tabId);
     }
-  }, [tabs, messageCache]);
+  }, [tabs, messageCache, deleteTab]);
 
   const confirmCloseTab = useCallback(() => {
     if (tabToClose) {
-      serverApi.deleteTab(tabToClose);
+      deleteTab(tabToClose);
       setTabToClose(null);
     }
-  }, [tabToClose]);
+  }, [tabToClose, deleteTab]);
 
   const handleTabClick = useCallback((tabId: string) => {
     // Find the index of the clicked tab
@@ -633,43 +608,45 @@ export default function App() {
       setUrlTabIndex(index, false);
     }
     // Also set active tab directly for immediate response
-    serverApi.setActiveTab(tabId);
-  }, [tabs, setUrlTabIndex]);
+    setActiveTabId(tabId);
+  }, [tabs, setUrlTabIndex, setActiveTabId]);
 
   const handleInterrupt = useCallback(async () => {
-    if (activeTab) {
-      await serverApi.interruptProcess(activeTab.processId, activeTab.id);
+    if (activeTab?.sessionId) {
+      await serverApi.interruptProcess(activeTab.sessionId);
     }
   }, [activeTab]);
 
-  const handleNewSession = useCallback(async () => {
+  const handleNewSession = useCallback(() => {
     if (activeTab) {
       // Clear session from tab
-      await serverApi.setTabSession(activeTab.id, '');
+      setTabSession(activeTab.id, '');
     }
     setShowWelcome(true);
-  }, [activeTab]);
+  }, [activeTab, setTabSession]);
 
   // Session selection with 1:1 constraint
-  const handleSessionSelect = useCallback(async (selectedSessionId: string, projectPath: string, firstPrompt?: string) => {
+  const handleSessionSelect = useCallback((selectedSessionId: string, projectPath: string, firstPrompt?: string) => {
     if (!activeTab) return;
 
     // Check if session is already open in another tab
-    const result = await serverApi.setTabSession(activeTab.id, selectedSessionId);
-
-    if (!result.success && result.existingTabId) {
+    const existingTab = findTabBySession(selectedSessionId);
+    if (existingTab && existingTab.id !== activeTab.id) {
       // Session already open - switch to that tab
-      await serverApi.setActiveTab(result.existingTabId);
+      setActiveTabId(existingTab.id);
       setShowSessionList(false);
       return;
     }
+
+    // Set session on current tab
+    setTabSession(activeTab.id, selectedSessionId);
 
     // Set workDir and firstPrompt metadata
     setSessionMetadata(selectedSessionId, { workDir: projectPath, firstPrompt });
 
     setShowWelcome(false);
     setShowSessionList(false);
-  }, [activeTab, setSessionMetadata]);
+  }, [activeTab, setTabSession, setSessionMetadata, setActiveTabId, findTabBySession]);
 
   const handleDirectorySelect = useCallback((path: string) => {
     // Update workDir for new sessions and save to localStorage
@@ -704,16 +681,12 @@ export default function App() {
       <header className="shrink-0 bg-bg-secondary border-b border-border">
         <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-bg-secondary">
           <div className="flex items-center gap-3">
-            <span
-              className={`text-xs ${
-                serverHealth === 'healthy'
-                  ? 'text-accent-green'
-                  : serverHealth === 'unhealthy'
-                    ? 'text-accent-red'
-                    : 'text-accent-orange animate-pulse'
-              }`}
-              title={`Server: ${serverHealth}`}
-            >●</span>
+            {/* Apple-style window buttons */}
+            <div className="flex items-center gap-1.5" title={`Server: ${serverHealth}`}>
+              <span className={`text-xs ${serverHealth === 'unhealthy' ? 'opacity-50' : ''}`} style={{ color: '#ff5f57' }}>●</span>
+              <span className={`text-xs ${serverHealth === 'checking' ? 'animate-pulse' : ''}`} style={{ color: '#febc2e' }}>●</span>
+              <span className={`text-xs ${serverHealth !== 'healthy' ? 'opacity-50' : ''}`} style={{ color: '#28c840' }}>●</span>
+            </div>
             <span className="text-accent-claude font-bold tracking-wider text-sm">CLAUDE</span>
             <span className="text-text-secondary text-xs">v2.0</span>
           </div>
@@ -733,6 +706,7 @@ export default function App() {
             const tabMessages = messageCache.get(tab.sessionId) || [];
             const firstUserMsg = tabMessages.find((m) => m.type === 'user');
             const metadata = tab.sessionId ? sessionMetadata.get(tab.sessionId) : undefined;
+            const tabSessionState = tab.sessionId ? getSessionState(tab.sessionId) : undefined;
             let tabTitle = firstUserMsg
               ? (firstUserMsg.content as string).slice(0, 25) + ((firstUserMsg.content as string).length > 25 ? '...' : '')
               : metadata?.firstPrompt
@@ -742,6 +716,7 @@ export default function App() {
                   : 'new';
 
             const isActive = tab.id === activeTabId;
+            const tabIsLoading = tabSessionState?.isLoading || false;
             return (
               <div
                 key={tab.id}
@@ -754,7 +729,7 @@ export default function App() {
               >
                 <span className="text-text-secondary">[{index}]</span>
                 <span className="max-w-40 truncate">
-                  {tab.isLoading && '⏳ '}
+                  {tabIsLoading && '⏳ '}
                   {tabTitle}
                 </span>
                 <button

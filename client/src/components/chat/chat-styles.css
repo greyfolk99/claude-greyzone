@@ -10,18 +10,25 @@ pre {
   position: relative;
 }
 
-/* Code block header bar with terminal dots */
-pre::before {
-  content: '● ● ●';
-  display: block;
+/* Code block header bar - dots added via JS in ChatMessage */
+pre {
+  position: relative;
+}
+
+/* Terminal header added via ChatMessage component */
+.code-header {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
   background-color: var(--bg-tertiary);
   border-bottom: 1px solid var(--border-color);
-  padding: 0.375rem 0.75rem;
-  font-size: 0.5rem;
-  letter-spacing: 0.25rem;
-  color: var(--text-secondary);
-  font-family: var(--font-mono);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.625rem;
 }
+
+.code-header .dot-red { color: #ff5f57; }
+.code-header .dot-yellow { color: #febc2e; }
+.code-header .dot-green { color: #28c840; }
 
 pre code {
   display: block;

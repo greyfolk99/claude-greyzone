@@ -53,18 +53,22 @@ export type SessionMetadata = {
   isSidechain: boolean;
 };
 
-// Tab state from server (minimal - no messages)
+// Tab state (client-side only, stored in localStorage)
 export type TabState = {
   id: string;
   sessionId: string;  // empty string = new session
+};
+
+// Session state from server (per-session processing status)
+export type SessionState = {
+  sessionId: string;
   isLoading: boolean;
   processId: number | null;
 };
 
-// Server state (in-memory, no persistence)
+// Server state (session processing status only - no tabs)
 export type ServerState = {
-  tabs: TabState[];
-  activeTabId: string;
+  sessions: Record<string, SessionState>;  // sessionId -> state
   version: number;
 };
 
@@ -76,9 +80,11 @@ export type ActiveProcess = {
   startTime: number;
 };
 
-// Local tab state (extends server state with client-side data)
+// Local tab state (tab + messages + metadata)
 export type LocalTabState = TabState & {
   messages: Message[];        // Loaded from CLI session on-demand
   messagesLoaded: boolean;    // Whether messages have been loaded
   workDir: string;            // From session metadata
+  isLoading: boolean;         // From server session state
+  processId: number | null;   // From server session state
 };

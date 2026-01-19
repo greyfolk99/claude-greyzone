@@ -59,6 +59,7 @@ func main() {
 		api.POST("/chat", handlers.Chat)
 		api.DELETE("/chat", handlers.InterruptChat)
 		api.POST("/chat/interactive", handlers.ChatInteractive)
+		api.GET("/chat/ws", handlers.ChatWebSocket)
 		api.POST("/directories", handlers.ListDirectories)
 		api.POST("/files", handlers.ListFiles)
 		api.POST("/file/read", handlers.ReadFile)
@@ -78,14 +79,9 @@ func main() {
 			})
 		})
 
-		// State management (server-side state) - simplified, no message persistence
+		// State management (session processing status only - tabs managed client-side)
 		api.GET("/state", handlers.GetState)
 		api.GET("/state/subscribe", handlers.SubscribeState)
-		api.POST("/state/tabs", handlers.CreateTabHandler)
-		api.DELETE("/state/tabs/:id", handlers.DeleteTabHandler)
-		api.POST("/state/tabs/:id/active", handlers.SetActiveTabHandler)
-		api.POST("/state/tabs/:id/session", handlers.SetTabSessionHandler)
-		api.GET("/state/session/:sessionId/tab", handlers.GetSessionTabHandler)
 	}
 
 	// Serve index.html for root and any unmatched routes (SPA fallback)

@@ -1,15 +1,33 @@
 import { create } from 'zustand';
-import type { ServerState, TabState, Message, LocalTabState, ActiveProcess, ContentBlock } from './types';
+import type { ServerState, TabState, Message, SessionState, ContentBlock } from './types';
 
 // Local storage keys
 const TABS_STORAGE_KEY = 'claude-web-ui-tabs';
+const ACTIVE_TAB_KEY = 'claude-web-ui-active-tab';
 const LAST_WORKDIR_KEY = 'claude-web-ui-last-workdir';
 const AUTO_EXPAND_TOOLS_KEY = 'claude-web-ui-auto-expand-tools';
 
+// Generate unique tab ID
+function generateTabId(): string {
+  return 'tab-' + Math.random().toString(36).substring(2, 10);
+}
+
 interface ChatStore {
-  // Server state (synced via SSE)
+  // Client-side tab management (localStorage backed)
+  tabs: TabState[];
+  activeTabId: string;
+  setTabs: (tabs: TabState[]) => void;
+  setActiveTabId: (tabId: string) => void;
+  createTab: () => TabState;
+  deleteTab: (tabId: string) => void;
+  setTabSession: (tabId: string, sessionId: string) => void;
+
+  // Server state (session processing status only)
   serverState: ServerState;
   setServerState: (state: ServerState) => void;
+
+  // Get session state from server
+  getSessionState: (sessionId: string) => SessionState | undefined;
 
   // Local message cache (per session)
   messageCache: Map<string, Message[]>;
@@ -17,34 +35,121 @@ interface ChatStore {
   appendMessage: (sessionId: string, message: Message) => void;
   clearMessages: (sessionId: string) => void;
 
-  // Message queue (per tab) - client-side only, for queuing while processing
-  messageQueue: Map<string, string[]>;
-  addToQueue: (tabId: string, message: string) => void;
-  popFromQueue: (tabId: string) => string | undefined;
-  clearQueue: (tabId: string) => void;
-  getQueue: (tabId: string) => string[];
-
   // Session metadata cache (workDir, firstPrompt, etc.)
   sessionMetadata: Map<string, { workDir: string; firstPrompt?: string }>;
   setSessionMetadata: (sessionId: string, metadata: { workDir: string; firstPrompt?: string }) => void;
 
   // Helpers
   getActiveTab: () => TabState | undefined;
-  getLocalTab: (tabId: string) => LocalTabState | undefined;
+  isSessionOpen: (sessionId: string) => boolean;
+  findTabBySession: (sessionId: string) => TabState | undefined;
 }
 
+// Load initial tabs from localStorage
+function loadTabsFromStorage(): { tabs: TabState[], activeTabId: string } {
+  try {
+    const tabsJson = localStorage.getItem(TABS_STORAGE_KEY);
+    const activeTabId = localStorage.getItem(ACTIVE_TAB_KEY) || '';
+
+    if (tabsJson) {
+      const tabs = JSON.parse(tabsJson) as TabState[];
+      if (tabs.length > 0) {
+        // Validate activeTabId
+        const validActiveId = tabs.find(t => t.id === activeTabId) ? activeTabId : tabs[0].id;
+        return { tabs, activeTabId: validActiveId };
+      }
+    }
+  } catch (e) {
+    console.error('Failed to load tabs from localStorage:', e);
+  }
+
+  // Default: one empty tab
+  const defaultTab: TabState = { id: generateTabId(), sessionId: '' };
+  return { tabs: [defaultTab], activeTabId: defaultTab.id };
+}
+
+// Save tabs to localStorage
+function saveTabsToStorage(tabs: TabState[], activeTabId: string): void {
+  try {
+    localStorage.setItem(TABS_STORAGE_KEY, JSON.stringify(tabs));
+    localStorage.setItem(ACTIVE_TAB_KEY, activeTabId);
+  } catch (e) {
+    console.error('Failed to save tabs to localStorage:', e);
+  }
+}
+
+const initialState = loadTabsFromStorage();
+
 export const useChatStore = create<ChatStore>()((set, get) => ({
+  // Client-side tab state
+  tabs: initialState.tabs,
+  activeTabId: initialState.activeTabId,
+
+  // Server state (sessions only)
   serverState: {
-    tabs: [],
-    activeTabId: '',
+    sessions: {},
     version: 0,
   },
 
   messageCache: new Map(),
-  messageQueue: new Map(),
   sessionMetadata: new Map(),
 
+  setTabs: (tabs) => {
+    const { activeTabId } = get();
+    set({ tabs });
+    saveTabsToStorage(tabs, activeTabId);
+  },
+
+  setActiveTabId: (activeTabId) => {
+    const { tabs } = get();
+    set({ activeTabId });
+    saveTabsToStorage(tabs, activeTabId);
+  },
+
+  createTab: () => {
+    const { tabs, activeTabId } = get();
+    const newTab: TabState = { id: generateTabId(), sessionId: '' };
+    const newTabs = [...tabs, newTab];
+    set({ tabs: newTabs, activeTabId: newTab.id });
+    saveTabsToStorage(newTabs, newTab.id);
+    return newTab;
+  },
+
+  deleteTab: (tabId) => {
+    const { tabs, activeTabId } = get();
+    let newTabs = tabs.filter(t => t.id !== tabId);
+
+    // Ensure at least one tab exists
+    if (newTabs.length === 0) {
+      const newTab: TabState = { id: generateTabId(), sessionId: '' };
+      newTabs = [newTab];
+    }
+
+    // Update active tab if needed
+    let newActiveTabId = activeTabId;
+    if (activeTabId === tabId) {
+      newActiveTabId = newTabs[newTabs.length - 1].id;
+    }
+
+    set({ tabs: newTabs, activeTabId: newActiveTabId });
+    saveTabsToStorage(newTabs, newActiveTabId);
+  },
+
+  setTabSession: (tabId, sessionId) => {
+    const { tabs, activeTabId } = get();
+    const newTabs = tabs.map(t =>
+      t.id === tabId ? { ...t, sessionId } : t
+    );
+    set({ tabs: newTabs });
+    saveTabsToStorage(newTabs, activeTabId);
+  },
+
   setServerState: (state) => set({ serverState: state }),
+
+  getSessionState: (sessionId) => {
+    const { serverState } = get();
+    return serverState.sessions[sessionId];
+  },
 
   setMessages: (sessionId, messages) => {
     const cache = new Map(get().messageCache);
@@ -65,34 +170,6 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     set({ messageCache: cache });
   },
 
-  // Message queue methods
-  addToQueue: (tabId, message) => {
-    const queue = new Map(get().messageQueue);
-    const existing = queue.get(tabId) || [];
-    queue.set(tabId, [...existing, message]);
-    set({ messageQueue: queue });
-  },
-
-  popFromQueue: (tabId) => {
-    const queue = new Map(get().messageQueue);
-    const existing = queue.get(tabId) || [];
-    if (existing.length === 0) return undefined;
-    const [first, ...rest] = existing;
-    queue.set(tabId, rest);
-    set({ messageQueue: queue });
-    return first;
-  },
-
-  clearQueue: (tabId) => {
-    const queue = new Map(get().messageQueue);
-    queue.delete(tabId);
-    set({ messageQueue: queue });
-  },
-
-  getQueue: (tabId) => {
-    return get().messageQueue.get(tabId) || [];
-  },
-
   setSessionMetadata: (sessionId, metadata) => {
     const metadataCache = new Map(get().sessionMetadata);
     metadataCache.set(sessionId, metadata);
@@ -100,32 +177,114 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
   },
 
   getActiveTab: () => {
-    const { serverState } = get();
-    return serverState.tabs.find((t) => t.id === serverState.activeTabId);
+    const { tabs, activeTabId } = get();
+    return tabs.find((t) => t.id === activeTabId);
   },
 
-  getLocalTab: (tabId: string) => {
-    const { serverState, messageCache, sessionMetadata } = get();
-    const tab = serverState.tabs.find((t) => t.id === tabId);
-    if (!tab) return undefined;
+  isSessionOpen: (sessionId) => {
+    const { tabs } = get();
+    return tabs.some(t => t.sessionId === sessionId);
+  },
 
-    const messages = tab.sessionId ? messageCache.get(tab.sessionId) || [] : [];
-    const metadata = tab.sessionId ? sessionMetadata.get(tab.sessionId) : undefined;
-
-    return {
-      ...tab,
-      messages,
-      messagesLoaded: tab.sessionId ? messageCache.has(tab.sessionId) : true,
-      workDir: metadata?.workDir || '',
-    };
+  findTabBySession: (sessionId) => {
+    const { tabs } = get();
+    return tabs.find(t => t.sessionId === sessionId);
   },
 }));
 
 
+// ============ WebSocket Chat API ============
+
+export type WSMessageHandler = {
+  onData: (data: string) => void;
+  onError: (message: string) => void;
+  onDone: () => void;
+  onInputRequest?: (data: unknown) => void;
+  onProcessId?: (processId: number) => void;
+};
+
+export function createChatWebSocket(
+  request: { prompt: string; sessionId?: string; workDir?: string },
+  handlers: WSMessageHandler
+): { sendInput: (input: string) => void; interrupt: () => void; close: () => void } {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${protocol}//${window.location.host}/api/chat/ws`);
+
+  let sessionId = request.sessionId;
+
+  ws.onopen = () => {
+    // Send chat request
+    ws.send(JSON.stringify({
+      type: 'chat',
+      payload: request,
+    }));
+  };
+
+  ws.onmessage = (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      switch (msg.type) {
+        case 'data':
+          handlers.onData(msg.data);
+          break;
+        case 'error':
+          handlers.onError(msg.message);
+          break;
+        case 'done':
+          handlers.onDone();
+          break;
+        case 'inputRequest':
+          handlers.onInputRequest?.(msg.data);
+          break;
+        case 'processId':
+          handlers.onProcessId?.(msg.processId);
+          break;
+        case 'stderr':
+          // Log stderr but don't treat as error
+          console.log('[WS stderr]', msg.message);
+          break;
+      }
+    } catch (e) {
+      console.error('[WS] Parse error:', e);
+    }
+  };
+
+  ws.onerror = (err) => {
+    console.error('[WS] Error:', err);
+    handlers.onError('WebSocket connection error');
+  };
+
+  ws.onclose = () => {
+    console.log('[WS] Connection closed');
+  };
+
+  return {
+    sendInput: (input: string) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'input',
+          payload: { input },
+        }));
+      }
+    },
+    interrupt: () => {
+      if (ws.readyState === WebSocket.OPEN && sessionId) {
+        ws.send(JSON.stringify({
+          type: 'interrupt',
+          payload: { sessionId },
+        }));
+      }
+    },
+    close: () => {
+      ws.close();
+    },
+  };
+}
+
 // ============ Server API ============
 
 export const serverApi = {
-  // SSE subscription for state updates
+  // SSE subscription for session state updates
   subscribe(onMessage: (state: ServerState) => void, onError?: (err: Error) => void) {
     let eventSource: EventSource | null = null;
     let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -166,57 +325,20 @@ export const serverApi = {
     };
   },
 
-  // Get current state
+  // Get current session state
   async getState(): Promise<ServerState> {
     const res = await fetch('/api/state');
     if (!res.ok) throw new Error(`Failed to get state: ${res.status}`);
     return res.json();
   },
 
-  // Tab management
-  async createTab(): Promise<TabState> {
-    const res = await fetch('/api/state/tabs', { method: 'POST' });
-    if (!res.ok) throw new Error(`Failed to create tab: ${res.status}`);
-    return res.json();
-  },
-
-  async deleteTab(tabId: string): Promise<void> {
-    const res = await fetch(`/api/state/tabs/${tabId}`, { method: 'DELETE' });
-    if (!res.ok) throw new Error(`Failed to delete tab: ${res.status}`);
-  },
-
-  async setActiveTab(tabId: string): Promise<void> {
-    const res = await fetch(`/api/state/tabs/${tabId}/active`, { method: 'POST' });
-    if (!res.ok) throw new Error(`Failed to set active tab: ${res.status}`);
-  },
-
-  // Session management (with 1:1 constraint)
-  async setTabSession(tabId: string, sessionId: string): Promise<{ success: boolean; existingTabId?: string }> {
-    const res = await fetch(`/api/state/tabs/${tabId}/session`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId }),
-    });
-
-    if (res.status === 409) {
-      // Session already open in another tab
-      const data = await res.json();
-      return { success: false, existingTabId: data.existingTabId };
-    }
-
-    if (!res.ok) throw new Error(`Failed to set session: ${res.status}`);
-    return { success: true };
-  },
-
-  async getSessionTab(sessionId: string): Promise<string | null> {
-    const res = await fetch(`/api/state/session/${sessionId}/tab`);
-    if (!res.ok) throw new Error(`Failed to get session tab: ${res.status}`);
-    const data = await res.json();
-    return data.tabId;
-  },
-
   // Get active processes (to check if session is processing)
-  async getActiveProcesses(): Promise<ActiveProcess[]> {
+  async getActiveProcesses(): Promise<Array<{
+    processId: number;
+    sessionId: string;
+    workDir: string;
+    startTime: number;
+  }>> {
     const res = await fetch('/api/processes');
     if (!res.ok) throw new Error(`Failed to get processes: ${res.status}`);
     const data = await res.json();
@@ -319,10 +441,9 @@ export const serverApi = {
   },
 
   // Interrupt process
-  async interruptProcess(processId: number | null, tabId?: string): Promise<void> {
+  async interruptProcess(sessionId: string): Promise<void> {
     const params = new URLSearchParams();
-    if (processId) params.set('processId', String(processId));
-    if (tabId) params.set('tabId', tabId);
+    if (sessionId) params.set('sessionId', sessionId);
     await fetch(`/api/chat?${params.toString()}`, { method: 'DELETE' });
   },
 };
@@ -330,36 +451,6 @@ export const serverApi = {
 // ============ Local Storage Helpers ============
 
 export const localStorageApi = {
-  // Save open tabs info (just sessionIds)
-  saveOpenTabs(tabs: Array<{ id: string; sessionId: string }>): void {
-    try {
-      localStorage.setItem(TABS_STORAGE_KEY, JSON.stringify(tabs));
-    } catch (e) {
-      console.error('Failed to save tabs to localStorage:', e);
-    }
-  },
-
-  // Load saved tabs info
-  loadOpenTabs(): Array<{ id: string; sessionId: string }> {
-    try {
-      const data = localStorage.getItem(TABS_STORAGE_KEY);
-      if (!data) return [];
-      return JSON.parse(data);
-    } catch (e) {
-      console.error('Failed to load tabs from localStorage:', e);
-      return [];
-    }
-  },
-
-  // Clear saved tabs
-  clearOpenTabs(): void {
-    try {
-      localStorage.removeItem(TABS_STORAGE_KEY);
-    } catch (e) {
-      console.error('Failed to clear tabs from localStorage:', e);
-    }
-  },
-
   // Save last used workDir
   saveLastWorkDir(workDir: string): void {
     try {

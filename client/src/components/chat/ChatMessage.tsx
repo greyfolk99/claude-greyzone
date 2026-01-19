@@ -40,10 +40,21 @@ export const ChatMessage = memo(function ChatMessage({ message, autoExpandTools 
   const contentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    // Apply syntax highlighting to any code blocks that weren't caught by marked
     if (contentRef.current) {
+      // Apply syntax highlighting to any code blocks that weren't caught by marked
       contentRef.current.querySelectorAll('pre code').forEach((block) => {
         hljs.highlightElement(block as HTMLElement);
+      });
+
+      // Add terminal header with colored dots to code blocks
+      contentRef.current.querySelectorAll('pre').forEach((pre) => {
+        // Skip if header already exists
+        if (pre.querySelector('.code-header')) return;
+
+        const header = document.createElement('div');
+        header.className = 'code-header';
+        header.innerHTML = '<span class="dot-red">●</span><span class="dot-yellow">●</span><span class="dot-green">●</span>';
+        pre.insertBefore(header, pre.firstChild);
       });
     }
   }, [message]);

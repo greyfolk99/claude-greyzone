@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -16,20 +15,17 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// TabState represents the minimal state of a single tab
-// Messages are NOT stored here - they come from Claude CLI sessions on-demand
-type TabState struct {
-	ID        string `json:"id"`
-	SessionID string `json:"sessionId,omitempty"` // Claude CLI session ID (empty = new session)
+// SessionState represents the processing state of a session
+type SessionState struct {
+	SessionID string `json:"sessionId"`
 	IsLoading bool   `json:"isLoading"`
 	ProcessID *int   `json:"processId,omitempty"`
 }
 
-// AppState represents the entire application state (in-memory only, no persistence)
+// AppState represents the server state (session processing status only)
 type AppState struct {
-	Tabs        []TabState `json:"tabs"`
-	ActiveTabID string     `json:"activeTabId"`
-	Version     int64      `json:"version"`
+	Sessions map[string]*SessionState `json:"sessions"` // sessionId -> state
+	Version  int64                    `json:"version"`
 }
 
 // SSE client for state updates
@@ -39,8 +35,7 @@ type StateClient struct {
 	Done    chan struct{}
 }
 
-// StateManager handles all state operations with proper concurrency
-// This is intentionally in-memory only - no file persistence
+// StateManager handles session state with proper concurrency
 type StateManager struct {
 	state    AppState
 	mu       sync.RWMutex
@@ -54,25 +49,18 @@ func init() {
 	stateManager = &StateManager{
 		clients: make(map[string]*StateClient),
 		state: AppState{
-			Tabs:    []TabState{},
-			Version: time.Now().UnixMilli(),
+			Sessions: make(map[string]*SessionState),
+			Version:  time.Now().UnixMilli(),
 		},
 	}
 
-	// Create one default tab on startup
-	defaultTab := TabState{
-		ID: generateID(),
-	}
-	stateManager.state.Tabs = []TabState{defaultTab}
-	stateManager.state.ActiveTabID = defaultTab.ID
-
-	log.Printf("StateManager initialized (in-memory only, no persistence)")
+	log.Printf("StateManager initialized (session state only, tabs managed client-side)")
 }
 
 func generateID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
-	return "tab-" + hex.EncodeToString(b)
+	return hex.EncodeToString(b)
 }
 
 // Broadcast state to all connected clients
@@ -89,7 +77,6 @@ func (sm *StateManager) broadcast() {
 		select {
 		case client.Channel <- data:
 		default:
-			// Client buffer full - log warning instead of silently dropping
 			log.Printf("Warning: client %s buffer full, state update dropped", client.ID)
 		}
 	}
@@ -127,167 +114,87 @@ func (sm *StateManager) getState() AppState {
 	defer sm.mu.RUnlock()
 
 	stateCopy := AppState{
-		Tabs:        make([]TabState, len(sm.state.Tabs)),
-		ActiveTabID: sm.state.ActiveTabID,
-		Version:     sm.state.Version,
+		Sessions: make(map[string]*SessionState),
+		Version:  sm.state.Version,
 	}
 
-	// Copy tabs and sync loading state with actual process state
-	for i, tab := range sm.state.Tabs {
-		tabCopy := tab
-		// If tab has a processId, verify it's still running
-		if tab.ProcessID != nil {
+	// Copy sessions and sync loading state with actual process state
+	for sessionId, session := range sm.state.Sessions {
+		sessionCopy := &SessionState{
+			SessionID: session.SessionID,
+			IsLoading: session.IsLoading,
+			ProcessID: session.ProcessID,
+		}
+		// If session has a processId, verify it's still running
+		if session.ProcessID != nil {
 			processLock.RLock()
-			_, stillRunning := activeProcesses[*tab.ProcessID]
+			_, stillRunning := activeProcesses[*session.ProcessID]
 			processLock.RUnlock()
 			if !stillRunning {
 				// Process finished but state wasn't updated - fix it
-				tabCopy.IsLoading = false
-				tabCopy.ProcessID = nil
+				sessionCopy.IsLoading = false
+				sessionCopy.ProcessID = nil
 			}
 		}
-		stateCopy.Tabs[i] = tabCopy
+		stateCopy.Sessions[sessionId] = sessionCopy
 	}
 	return stateCopy
 }
 
-// FindTab finds a tab by ID
-func (sm *StateManager) findTab(tabID string) *TabState {
+// GetSessionState returns state for a specific session
+func (sm *StateManager) getSessionState(sessionId string) *SessionState {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
-	for i, t := range sm.state.Tabs {
-		if t.ID == tabID {
-			return &sm.state.Tabs[i]
-		}
+	if session, ok := sm.state.Sessions[sessionId]; ok {
+		return session
 	}
 	return nil
 }
 
-// FindTabBySession finds a tab by session ID (for 1:1 constraint)
-func (sm *StateManager) findTabBySession(sessionID string) *TabState {
-	if sessionID == "" {
-		return nil
+// SetSessionLoading sets the loading state for a session
+func (sm *StateManager) setSessionLoading(sessionId string, loading bool) {
+	if sessionId == "" {
+		return
 	}
 
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-
-	for i, t := range sm.state.Tabs {
-		if t.SessionID == sessionID {
-			return &sm.state.Tabs[i]
-		}
-	}
-	return nil
-}
-
-// IsSessionOpen checks if a session is already open in any tab
-func (sm *StateManager) isSessionOpen(sessionID string) bool {
-	return sm.findTabBySession(sessionID) != nil
-}
-
-// CreateTab creates a new tab and returns it
-func (sm *StateManager) createTab() TabState {
-	newTab := TabState{
-		ID: generateID(),
-	}
-
-	sm.mu.Lock()
-	sm.state.Tabs = append(sm.state.Tabs, newTab)
-	sm.state.ActiveTabID = newTab.ID
-	sm.mu.Unlock()
-
-	sm.broadcast()
-	return newTab
-}
-
-// DeleteTab removes a tab
-func (sm *StateManager) deleteTab(tabID string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	newTabs := make([]TabState, 0, len(sm.state.Tabs))
-	for _, t := range sm.state.Tabs {
-		if t.ID != tabID {
-			newTabs = append(newTabs, t)
+	if _, ok := sm.state.Sessions[sessionId]; !ok {
+		sm.state.Sessions[sessionId] = &SessionState{
+			SessionID: sessionId,
 		}
 	}
+	sm.state.Sessions[sessionId].IsLoading = loading
 
-	// If no tabs left, create a new empty one
-	if len(newTabs) == 0 {
-		newTab := TabState{ID: generateID()}
-		newTabs = []TabState{newTab}
-		sm.state.ActiveTabID = newTab.ID
-	} else if sm.state.ActiveTabID == tabID {
-		// If deleted tab was active, switch to last tab
-		sm.state.ActiveTabID = newTabs[len(newTabs)-1].ID
-	}
-
-	sm.state.Tabs = newTabs
-
-	go sm.broadcast()
-}
-
-// SetActiveTab sets the active tab
-func (sm *StateManager) setActiveTab(tabID string) {
-	sm.mu.Lock()
-	sm.state.ActiveTabID = tabID
-	sm.mu.Unlock()
-
-	sm.broadcast()
-}
-
-// SetTabSession sets the session ID for a tab (with 1:1 constraint)
-func (sm *StateManager) setTabSession(tabID, sessionID string) error {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	// Check 1:1 constraint: session can only be open in one tab
-	if sessionID != "" {
-		for _, t := range sm.state.Tabs {
-			if t.ID != tabID && t.SessionID == sessionID {
-				return fmt.Errorf("session %s is already open in tab %s", sessionID, t.ID)
-			}
-		}
-	}
-
-	// Set session ID
-	for i, t := range sm.state.Tabs {
-		if t.ID == tabID {
-			sm.state.Tabs[i].SessionID = sessionID
-			break
-		}
-	}
-
-	go sm.broadcast()
-	return nil
-}
-
-// SetTabLoading sets the loading state for a tab
-func (sm *StateManager) setTabLoading(tabID string, loading bool) {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	for i, t := range sm.state.Tabs {
-		if t.ID == tabID {
-			sm.state.Tabs[i].IsLoading = loading
-			break
-		}
+	// Clean up if session is no longer loading and has no process
+	if !loading && sm.state.Sessions[sessionId].ProcessID == nil {
+		delete(sm.state.Sessions, sessionId)
 	}
 
 	go sm.broadcast()
 }
 
-// SetTabProcessID sets the process ID for a tab
-func (sm *StateManager) setTabProcessID(tabID string, processID *int) {
+// SetSessionProcessID sets the process ID for a session
+func (sm *StateManager) setSessionProcessID(sessionId string, processID *int) {
+	if sessionId == "" {
+		return
+	}
+
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	for i, t := range sm.state.Tabs {
-		if t.ID == tabID {
-			sm.state.Tabs[i].ProcessID = processID
-			break
+	if _, ok := sm.state.Sessions[sessionId]; !ok {
+		sm.state.Sessions[sessionId] = &SessionState{
+			SessionID: sessionId,
 		}
+	}
+	sm.state.Sessions[sessionId].ProcessID = processID
+
+	// Clean up if session is no longer loading and has no process
+	if !sm.state.Sessions[sessionId].IsLoading && processID == nil {
+		delete(sm.state.Sessions, sessionId)
 	}
 
 	go sm.broadcast()
@@ -353,107 +260,34 @@ func SubscribeState(c *gin.Context) {
 	}
 }
 
-func CreateTabHandler(c *gin.Context) {
-	tab := stateManager.createTab()
-	c.JSON(http.StatusOK, tab)
-}
-
-func DeleteTabHandler(c *gin.Context) {
-	tabID := c.Param("id")
-	stateManager.deleteTab(tabID)
-	c.JSON(http.StatusOK, gin.H{"success": true})
-}
-
-func SetActiveTabHandler(c *gin.Context) {
-	tabID := c.Param("id")
-	stateManager.setActiveTab(tabID)
-	c.JSON(http.StatusOK, gin.H{"success": true})
-}
-
-// SetTabSessionRequest is the request body for setting tab session
-type SetTabSessionRequest struct {
-	SessionID string `json:"sessionId"`
-}
-
-func SetTabSessionHandler(c *gin.Context) {
-	tabID := c.Param("id")
-
-	var req SetTabSessionRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	if err := stateManager.setTabSession(tabID, req.SessionID); err != nil {
-		// Session already open in another tab - return the tab ID
-		existingTab := stateManager.findTabBySession(req.SessionID)
-		if existingTab != nil {
-			c.JSON(http.StatusConflict, gin.H{
-				"error":         err.Error(),
-				"existingTabId": existingTab.ID,
-			})
-			return
-		}
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"success": true})
-}
-
-// GetSessionTabHandler returns the tab ID for a session (or null if not open)
-func GetSessionTabHandler(c *gin.Context) {
-	sessionID := c.Param("sessionId")
-
-	tab := stateManager.findTabBySession(sessionID)
-	if tab == nil {
-		c.JSON(http.StatusOK, gin.H{"tabId": nil})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"tabId": tab.ID})
-}
-
 // === Internal functions for chat handler ===
 
-func SetTabLoading(tabID string, loading bool) {
-	stateManager.setTabLoading(tabID, loading)
+func SetSessionLoading(sessionId string, loading bool) {
+	stateManager.setSessionLoading(sessionId, loading)
 }
 
-func SetTabProcessID(tabID string, processID *int) {
-	stateManager.setTabProcessID(tabID, processID)
+func SetSessionProcessID(sessionId string, processID *int) {
+	stateManager.setSessionProcessID(sessionId, processID)
 }
 
-func SetTabSession(tabID string, sessionID string) error {
-	return stateManager.setTabSession(tabID, sessionID)
-}
-
-func IsTabLoading(tabID string) bool {
-	tab := stateManager.findTab(tabID)
-	if tab == nil {
+func IsSessionLoading(sessionId string) bool {
+	session := stateManager.getSessionState(sessionId)
+	if session == nil {
 		return false
 	}
-	// If tab has a processId, verify it's still actually running
-	if tab.IsLoading && tab.ProcessID != nil {
+	// If session has a processId, verify it's still actually running
+	if session.IsLoading && session.ProcessID != nil {
 		processLock.RLock()
-		_, stillRunning := activeProcesses[*tab.ProcessID]
+		_, stillRunning := activeProcesses[*session.ProcessID]
 		processLock.RUnlock()
 		if !stillRunning {
 			// Process finished but state wasn't updated - fix it now
-			stateManager.setTabLoading(tabID, false)
-			stateManager.setTabProcessID(tabID, nil)
+			stateManager.setSessionLoading(sessionId, false)
+			stateManager.setSessionProcessID(sessionId, nil)
 			return false
 		}
 	}
-	return tab.IsLoading
-}
-
-func GetTabSession(tabID string) string {
-	tab := stateManager.findTab(tabID)
-	if tab == nil {
-		return ""
-	}
-	return tab.SessionID
+	return session.IsLoading
 }
 
 // GetSessionWorkDir returns the workDir for a session by finding its file location

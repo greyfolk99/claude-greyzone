@@ -92,7 +92,6 @@ func GetActiveProcesses() []ActiveProcessInfo {
 
 // ChatRequest represents the request body for chat endpoints
 type ChatRequest struct {
-	TabID     string `json:"tabId"`
 	Prompt    string `json:"prompt"`
 	SessionID string `json:"sessionId"`
 	WorkDir   string `json:"workDir"`
@@ -131,38 +130,26 @@ func ChatInteractive(c *gin.Context) {
 
 // InterruptChat handles interrupting an active chat process
 func InterruptChat(c *gin.Context) {
-	processIDStr := c.Query("processId")
-	tabID := c.Query("tabId")
+	sessionID := c.Query("sessionId")
+
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "sessionId is required"})
+		return
+	}
 
 	var processID int
 	var cmd *exec.Cmd
 
-	if processIDStr != "" {
-		// Find by process ID
-		var err error
-		processID, err = strconv.Atoi(processIDStr)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid processId"})
-			return
+	// Find by session ID
+	processLock.RLock()
+	for pid, info := range activeProcesses {
+		if info.SessionID == sessionID {
+			processID = pid
+			cmd = info.Cmd
+			break
 		}
-		cmd = getProcess(processID)
-	} else if tabID != "" {
-		// Find by tab ID - look for process associated with this tab
-		processLock.RLock()
-		for pid, info := range activeProcesses {
-			// Check if this process belongs to the tab by checking server state
-			tab := stateManager.findTab(tabID)
-			if tab != nil && tab.ProcessID != nil && *tab.ProcessID == pid {
-				processID = pid
-				cmd = info.Cmd
-				break
-			}
-		}
-		processLock.RUnlock()
-	} else {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "processId or tabId is required"})
-		return
 	}
+	processLock.RUnlock()
 
 	if cmd == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "process not found"})
@@ -183,17 +170,12 @@ func InterruptChat(c *gin.Context) {
 
 // executeChatStream executes the claude CLI command and streams output via SSE
 func executeChatStream(c *gin.Context, req ChatRequest, withContinue bool) {
-	// Check if this tab is already loading
-	if req.TabID != "" && IsTabLoading(req.TabID) {
+	// Check if this session is already loading
+	if req.SessionID != "" && IsSessionLoading(req.SessionID) {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
-		sendSSEError(c, "This tab is already processing a request")
+		sendSSEError(c, "This session is already processing a request")
 		return
-	}
-
-	// Update tab state: loading = true
-	if req.TabID != "" {
-		SetTabLoading(req.TabID, true)
 	}
 
 	// Set SSE headers
@@ -314,17 +296,21 @@ func executeChatStream(c *gin.Context, req ChatRequest, withContinue bool) {
 		StartTime: time.Now().Unix(),
 	})
 
-	// Update tab state with processId
-	if req.TabID != "" {
-		SetTabProcessID(req.TabID, &processID)
+	// Track the session ID that will be assigned (for new sessions)
+	activeSessionID := req.SessionID
+
+	// Update session state with processId (will be updated with real sessionId when received)
+	if activeSessionID != "" {
+		SetSessionLoading(activeSessionID, true)
+		SetSessionProcessID(activeSessionID, &processID)
 	}
 
 	// Cleanup on exit
 	defer func() {
 		unregisterProcess(processID)
-		if req.TabID != "" {
-			SetTabLoading(req.TabID, false)
-			SetTabProcessID(req.TabID, nil)
+		if activeSessionID != "" {
+			SetSessionLoading(activeSessionID, false)
+			SetSessionProcessID(activeSessionID, nil)
 		}
 	}()
 
