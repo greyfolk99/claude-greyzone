@@ -22,6 +22,7 @@ func main() {
 	// Parse command line arguments
 	port := flag.Int("port", 43210, "Server port")
 	logDir := flag.String("log-dir", "./logs", "Log directory")
+	localOnly := flag.Bool("local", true, "Bind to localhost only (default: true)")
 	flag.Parse()
 
 	// Setup logging to file
@@ -90,7 +91,12 @@ func main() {
 	})
 
 	// Create HTTPS server
-	addr := fmt.Sprintf(":%d", *port)
+	var addr string
+	if *localOnly {
+		addr = fmt.Sprintf("127.0.0.1:%d", *port)
+	} else {
+		addr = fmt.Sprintf(":%d", *port)
+	}
 	server := &http.Server{
 		Addr:    addr,
 		Handler: router,
@@ -102,7 +108,7 @@ func main() {
 
 	// Start server in goroutine
 	go func() {
-		log.Printf("Starting HTTPS server on https://localhost%s", addr)
+		log.Printf("Starting HTTPS server on https://%s", addr)
 		if err := server.ListenAndServeTLS("cert.pem", "key.pem"); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Failed to start HTTPS server: %v", err)
 		}
