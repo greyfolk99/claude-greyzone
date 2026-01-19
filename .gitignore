@@ -1,0 +1,30 @@
+# Binaries
+claude-web-ui
+server
+
+# Logs
+logs/
+*.log
+
+# TLS certificates (sensitive)
+*.pem
+
+# Dependencies
+client/node_modules/
+
+# Build output
+client/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
