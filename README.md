@@ -2,6 +2,9 @@
 
 Personal web interface for Claude CLI.
 
+<img width="3456" height="2160" alt="Screenshot 2026-01-19 at 7 56 58 PM" src="https://github.com/user-attachments/assets/db854377-eaf4-462a-92fe-69c642811093" />
+
+
 ## Warning
 
 **Recommended for use only in VPN + sandbox environments.**
