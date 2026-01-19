@@ -189,6 +189,16 @@
   51%, 100% { opacity: 0; }
 }
 
+/* Color pulse animation for running sessions */
+@keyframes color-pulse {
+  0%, 100% { color: var(--accent-orange); }
+  50% { color: var(--accent-green); }
+}
+
+.animate-color-pulse {
+  animation: color-pulse 1.5s ease-in-out infinite;
+}
+
 .term-cursor {
   display: inline-block;
   width: 8px;

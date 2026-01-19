@@ -1,6 +1,7 @@
-export { FileExplorer } from './FileExplorer';
+export { FileExplorer, FileExplorerContent } from './FileExplorer';
 export { FileViewer } from './FileViewer';
-export { SessionList } from './SessionList';
-export { ConfigViewer } from './ConfigViewer';
-export { PluginsViewer } from './PluginsViewer';
-export { MCPViewer } from './MCPViewer';
+export { SessionList, SessionListContent } from './SessionList';
+export { ConfigViewer, ConfigViewerContent } from './ConfigViewer';
+export { PluginsViewer, PluginsViewerContent } from './PluginsViewer';
+export { MCPViewer, MCPViewerContent } from './MCPViewer';
+export { Sidebar } from './Sidebar';

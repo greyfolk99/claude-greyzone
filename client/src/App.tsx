@@ -2,9 +2,9 @@ import { useState, useCallback, useMemo, useEffect, useRef, useSyncExternalStore
 import { flushSync } from 'react-dom';
 import { FolderOpen, X } from 'lucide-react';
 import { ChatContainer, ChatInput } from '@/components/chat';
-import { FileExplorer, FileViewer, SessionList, ConfigViewer, PluginsViewer, MCPViewer } from '@/components/sidebar';
+import { FileExplorer, FileExplorerContent, FileViewer, SessionList, SessionListContent, ConfigViewer, ConfigViewerContent, PluginsViewer, PluginsViewerContent, MCPViewer, MCPViewerContent, Sidebar } from '@/components/sidebar';
 import { Terminal } from '@/components/terminal';
-import { useChatStore, serverApi, localStorageApi } from '@/store/chat-store';
+import { useChatStore, serverApi, localStorageApi, createChatWebSocket, subscribeToSession } from '@/store/chat-store';
 import type { Message, ContentBlock } from '@/store/types';
 
 // Simple URL-based routing for tabs
@@ -50,16 +50,22 @@ export default function App() {
     createTab,
     deleteTab,
     setTabSession,
-    serverState,
     setServerState,
+    serverState,
     messageCache,
     setMessages,
     sessionMetadata,
     setSessionMetadata,
     getSessionState,
-    isSessionOpen,
     findTabBySession,
   } = useChatStore();
+
+  // Get list of running session IDs from server state
+  const runningSessionIds = useMemo(() => {
+    return Object.entries(serverState.sessions)
+      .filter(([_, state]) => state.isLoading)
+      .map(([id]) => id);
+  }, [serverState.sessions]);
 
   // URL-based tab routing
   const { tabIndex: urlTabIndex, setTabIndex: setUrlTabIndex } = useTabRoute();
@@ -111,65 +117,85 @@ export default function App() {
   isLoadingRef.current = isLoading;
 
   // Streaming state - temporary display during streaming (NOT stored in cache)
-  // These are per-tab, so we store them in a Map keyed by tabId
-  const [streamingStateByTab, setStreamingStateByTab] = useState<Map<string, {
+  // These are per-session (keyed by sessionId), so switching tabs/sessions shows correct streaming
+  // pendingUserMessage: message I sent (blocks queue)
+  // broadcastedUserPrompt: message from another device (display only, doesn't block queue)
+  const [streamingStateBySession, setStreamingStateBySession] = useState<Map<string, {
     pendingUserMessage: string | null;
+    broadcastedUserPrompt: string | null;
     streamingContent: ContentBlock[];
   }>>(new Map());
 
   // Ref for streaming state (to avoid closure issues) - must be declared before callbacks that use it
-  const streamingStateByTabRef = useRef<Map<string, { pendingUserMessage: string | null; streamingContent: ContentBlock[] }>>(new Map());
+  const streamingStateBySessionRef = useRef<Map<string, { pendingUserMessage: string | null; broadcastedUserPrompt: string | null; streamingContent: ContentBlock[] }>>(new Map());
 
-  // Get current tab's streaming state
-  const currentStreamingState = activeTabId ? streamingStateByTab.get(activeTabId) : undefined;
+  // Get current session's streaming state (use sessionId, fallback to tabId for new sessions)
+  const streamingKey = sessionId || activeTabId || '';
+  const currentStreamingState = streamingKey ? streamingStateBySession.get(streamingKey) : undefined;
   const pendingUserMessage = currentStreamingState?.pendingUserMessage ?? null;
+  const broadcastedUserPrompt = currentStreamingState?.broadcastedUserPrompt ?? null;
   const streamingContent = currentStreamingState?.streamingContent ?? [];
 
-  // Helpers to update streaming state for a specific tab
-  const setPendingUserMessage = useCallback((tabId: string, message: string | null) => {
-    setStreamingStateByTab(prev => {
+  // Default streaming state
+  const defaultStreamingState = { pendingUserMessage: null, broadcastedUserPrompt: null, streamingContent: [] as ContentBlock[] };
+
+  // Helpers to update streaming state for a specific session (or tabId for new sessions)
+  const setPendingUserMessage = useCallback((key: string, message: string | null) => {
+    setStreamingStateBySession(prev => {
       const next = new Map(prev);
-      const current = next.get(tabId) || { pendingUserMessage: null, streamingContent: [] };
-      next.set(tabId, { ...current, pendingUserMessage: message });
+      const current = next.get(key) || defaultStreamingState;
+      next.set(key, { ...current, pendingUserMessage: message });
       // Update ref immediately for synchronous access
-      streamingStateByTabRef.current = next;
+      streamingStateBySessionRef.current = next;
       return next;
     });
   }, []);
 
-  const setStreamingContent = useCallback((tabId: string, content: ContentBlock[]) => {
-    setStreamingStateByTab(prev => {
+  const setBroadcastedUserPrompt = useCallback((key: string, prompt: string | null) => {
+    setStreamingStateBySession(prev => {
       const next = new Map(prev);
-      const current = next.get(tabId) || { pendingUserMessage: null, streamingContent: [] };
-      next.set(tabId, { ...current, streamingContent: content });
+      const current = next.get(key) || defaultStreamingState;
+      next.set(key, { ...current, broadcastedUserPrompt: prompt });
       return next;
     });
   }, []);
 
-  const clearStreamingState = useCallback((tabId: string) => {
-    setStreamingStateByTab(prev => {
+  const setStreamingContent = useCallback((key: string, content: ContentBlock[]) => {
+    setStreamingStateBySession(prev => {
       const next = new Map(prev);
-      next.delete(tabId);
+      const current = next.get(key) || defaultStreamingState;
+      next.set(key, { ...current, streamingContent: content });
+      return next;
+    });
+  }, []);
+
+  const clearStreamingState = useCallback((key: string) => {
+    setStreamingStateBySession(prev => {
+      const next = new Map(prev);
+      next.delete(key);
       // Update ref immediately for synchronous access
-      streamingStateByTabRef.current = next;
+      streamingStateBySessionRef.current = next;
       return next;
     });
   }, []);
 
-  const hasPendingMessage = useCallback((tabId: string) => {
-    return streamingStateByTabRef.current.get(tabId)?.pendingUserMessage != null;
+  const hasPendingMessage = useCallback((key: string) => {
+    return streamingStateBySessionRef.current.get(key)?.pendingUserMessage != null;
   }, []);
 
   // Get message queue for active tab (must be before messages calculation)
   const queuedMessages = activeTabId ? (queueByTab.get(activeTabId) || []) : [];
 
   // Combine cached messages with streaming content for display
-  // Order: cached → pending user → queued users → streaming response
+  // Order: cached → pending/broadcasted user → queued users → streaming response
   const messages: Message[] = (() => {
     const result = [...cachedMessages];
-    // Add pending user message if exists
+    // Add pending user message (local) OR broadcasted prompt (from another device)
+    // Only one should exist at a time; local takes precedence
     if (pendingUserMessage) {
       result.push({ type: 'user', content: pendingUserMessage });
+    } else if (broadcastedUserPrompt) {
+      result.push({ type: 'user', content: broadcastedUserPrompt });
     }
     // Add queued messages (after pending, before streaming response)
     for (const queuedMsg of queuedMessages) {
@@ -211,6 +237,26 @@ export default function App() {
   const [planMode, setPlanMode] = useState(false);
   const [serverHealth, setServerHealth] = useState<'healthy' | 'unhealthy' | 'checking'>('checking');
   const containerRef = useRef<HTMLDivElement>(null);
+
+  // Sidebar state
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    const saved = localStorage.getItem('sidebar-collapsed');
+    return saved ? JSON.parse(saved) : false;
+  });
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    const saved = localStorage.getItem('sidebar-width');
+    return saved ? parseInt(saved, 10) : 280;
+  });
+  const [sidebarPanel, setSidebarPanel] = useState<'sessions' | 'files' | 'config' | 'plugins' | 'mcp' | null>('sessions');
+
+  // Save sidebar state to localStorage
+  useEffect(() => {
+    localStorage.setItem('sidebar-collapsed', JSON.stringify(sidebarCollapsed));
+  }, [sidebarCollapsed]);
+
+  useEffect(() => {
+    localStorage.setItem('sidebar-width', String(sidebarWidth));
+  }, [sidebarWidth]);
   const loadingSessionsRef = useRef<Set<string>>(new Set());
   const sessionMtimeRef = useRef<Map<string, number>>(new Map());
 
@@ -417,18 +463,88 @@ export default function App() {
     };
   }, []);
 
-  // Send message handler - with queue support
+  // WebSocket connection ref for interrupt
+  const wsRef = useRef<{ sendInput: (input: string) => void; interrupt: () => void; close: () => void } | null>(null);
+
+  // Subscribe to session broadcasts when session is loading (from another device)
+  // This allows us to see real-time updates from other browsers
+  // Also subscribes when switching tabs to a session that's already loading
+  useEffect(() => {
+    if (!sessionId || !isLoading) return;
+
+    // Check if we already have a wsRef (meaning we initiated the request from this tab)
+    if (wsRef.current) return;
+
+    console.log('[Broadcast] Subscribing to session (late join):', sessionId);
+    let assistantContent: ContentBlock[] = [];
+
+    const sub = subscribeToSession(sessionId, {
+      onUserPrompt: (sid, prompt) => {
+        if (sid === sessionId) {
+          console.log('[Broadcast] User prompt received:', prompt);
+          // Use broadcastedUserPrompt instead of pendingUserMessage
+          // This way it doesn't block the queue for local messages
+          setBroadcastedUserPrompt(sessionId, prompt);
+        }
+      },
+      onData: (dataStr) => {
+        try {
+          const data = JSON.parse(dataStr);
+          if (data.type === 'assistant' && data.message?.content) {
+            for (const block of data.message.content) {
+              assistantContent.push(block as ContentBlock);
+            }
+            setStreamingContent(sessionId, [...assistantContent]);
+          }
+          if (data.type === 'user' && data.message?.content) {
+            for (const block of data.message.content) {
+              if (block.type === 'tool_result') {
+                assistantContent.push(block as ContentBlock);
+                setStreamingContent(sessionId, [...assistantContent]);
+              }
+            }
+          }
+        } catch {
+          // ignore parse errors
+        }
+      },
+      onDone: () => {
+        console.log('[Broadcast] Done');
+        clearStreamingState(sessionId);
+        // Reload history to get final state
+        serverApi.loadSessionHistory(sessionId).then(msgs => {
+          setMessages(sessionId, msgs);
+        });
+      },
+      onInterrupted: (message) => {
+        console.log('[Broadcast] Interrupted:', message);
+        clearStreamingState(sessionId);
+        // Reload history to get final state
+        serverApi.loadSessionHistory(sessionId).then(msgs => {
+          setMessages(sessionId, msgs);
+        });
+      },
+    });
+
+    return () => {
+      console.log('[Broadcast] Unsubscribing from session:', sessionId);
+      sub.close();
+    };
+  }, [sessionId, isLoading, setBroadcastedUserPrompt, setStreamingContent, clearStreamingState, setMessages]);
+
+  // Send message handler - with queue support (WebSocket based)
   // Source of truth: Claude CLI session files on server
-  const handleSendMessage = useCallback(async (text: string) => {
+  const handleSendMessage = useCallback((text: string) => {
     if (!activeTab) return;
 
     const targetTabId = activeTab.id;
     const targetSessionId = activeTab.sessionId;
+    // Streaming key: use sessionId if exists, otherwise tabId (for new sessions)
+    let streamingKey = targetSessionId || targetTabId;
 
     // Check if there's already a pending message or loading - add to queue
-    // Use refs to get latest values (avoids closure issues)
     const currentIsLoading = isLoadingRef.current;
-    const pending = hasPendingMessage(targetTabId);
+    const pending = hasPendingMessage(streamingKey);
     console.log('[handleSendMessage] isLoading:', currentIsLoading, 'hasPending:', pending);
     if (currentIsLoading || pending) {
       console.log('[handleSendMessage] -> going to queue');
@@ -442,44 +558,25 @@ export default function App() {
     // Force synchronous render so user sees their message immediately
     flushSync(() => {
       setShowWelcome(false);
-      setPendingUserMessage(targetTabId, text);
-      setStreamingContent(targetTabId, []);
+      setPendingUserMessage(streamingKey, text);
+      setStreamingContent(streamingKey, []);
     });
 
     // Track the current session ID (may change for new sessions)
     let currentSessionId = targetSessionId;
+    let assistantContent: ContentBlock[] = [];
 
-    try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt: text,
-          sessionId: targetSessionId || undefined,
-          workDir: targetSessionId ? undefined : workDir,
-        }),
-      });
-
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error('No response body');
-
-      const decoder = new TextDecoder();
-      let assistantContent: ContentBlock[] = [];
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-
+    // Create WebSocket connection
+    const ws = createChatWebSocket(
+      {
+        prompt: text,
+        sessionId: targetSessionId || undefined,
+        workDir: targetSessionId ? undefined : workDir,
+      },
+      {
+        onData: (dataStr) => {
           try {
-            const data = JSON.parse(line.slice(6));
+            const data = JSON.parse(dataStr);
 
             // Handle session init (new session)
             if (data.type === 'system' && data.subtype === 'init' && !targetSessionId) {
@@ -490,6 +587,16 @@ export default function App() {
                 // Set metadata for new session and save workDir to localStorage
                 setSessionMetadata(currentSessionId, { workDir });
                 localStorageApi.saveLastWorkDir(workDir);
+                // Migrate streaming state from tabId to sessionId
+                const oldState = streamingStateBySessionRef.current.get(streamingKey);
+                if (oldState) {
+                  clearStreamingState(streamingKey);
+                  streamingKey = currentSessionId;
+                  setPendingUserMessage(streamingKey, oldState.pendingUserMessage);
+                  setStreamingContent(streamingKey, oldState.streamingContent);
+                } else {
+                  streamingKey = currentSessionId;
+                }
               }
             }
 
@@ -498,8 +605,7 @@ export default function App() {
               for (const block of data.message.content) {
                 assistantContent.push(block as ContentBlock);
               }
-              // Update streaming content for real-time display
-              setStreamingContent(targetTabId, [...assistantContent]);
+              setStreamingContent(streamingKey, [...assistantContent]);
             }
 
             // Handle tool results
@@ -507,14 +613,14 @@ export default function App() {
               for (const block of data.message.content) {
                 if (block.type === 'tool_result') {
                   assistantContent.push(block as ContentBlock);
-                  setStreamingContent(targetTabId, [...assistantContent]);
+                  setStreamingContent(streamingKey, [...assistantContent]);
                 }
               }
             }
 
             if (data.type === 'error') {
               assistantContent.push({ type: 'text', text: `Error: ${data.message}` });
-              setStreamingContent(targetTabId, [...assistantContent]);
+              setStreamingContent(streamingKey, [...assistantContent]);
             }
 
             // Handle result type
@@ -522,50 +628,53 @@ export default function App() {
               if (data.is_error && data.errors?.length > 0) {
                 const errorMsg = data.errors.join(', ');
                 assistantContent.push({ type: 'text', text: `Error: ${errorMsg}` });
-                setStreamingContent(targetTabId, [...assistantContent]);
+                setStreamingContent(streamingKey, [...assistantContent]);
               }
             }
           } catch {
             // JSON parse error, skip
           }
-        }
-      }
+        },
+        onError: (message) => {
+          console.error('[WS] Error:', message);
+          assistantContent.push({ type: 'text', text: `Error: ${message}` });
+          setStreamingContent(streamingKey, [...assistantContent]);
+        },
+        onDone: async () => {
+          wsRef.current = null;
 
-      // Streaming complete - reload history from server (source of truth)
-      if (currentSessionId) {
-        try {
-          const loadedMessages = await serverApi.loadSessionHistory(currentSessionId, 100);
-          // Only update if we got messages - don't wipe existing on empty response
-          if (loadedMessages.length > 0) {
-            setMessages(currentSessionId, loadedMessages);
+          // Streaming complete - reload history from server (source of truth)
+          if (currentSessionId) {
+            try {
+              const loadedMessages = await serverApi.loadSessionHistory(currentSessionId, 100);
+              if (loadedMessages.length > 0) {
+                setMessages(currentSessionId, loadedMessages);
+              }
+
+              const mtimeInfo = await serverApi.getSessionMtime(currentSessionId);
+              if (mtimeInfo) {
+                sessionMtimeRef.current.set(currentSessionId, mtimeInfo.mtime);
+              }
+            } catch (historyError) {
+              console.error('Failed to reload history:', historyError);
+            }
           }
 
-          // Update mtime after streaming completes
-          const mtimeInfo = await serverApi.getSessionMtime(currentSessionId);
-          if (mtimeInfo) {
-            sessionMtimeRef.current.set(currentSessionId, mtimeInfo.mtime);
+          // Clear streaming state (use current streamingKey which may have changed)
+          clearStreamingState(streamingKey);
+
+          // After streaming completes, process queue if any
+          const queued = getQueueLatest(targetTabId);
+          if (queued.length > 0) {
+            clearQueue(targetTabId);
+            const combinedMessage = queued.join('\n\n---\n\n');
+            setTimeout(() => handleSendMessage(combinedMessage), 100);
           }
-        } catch (historyError) {
-          console.error('Failed to reload history:', historyError);
-          // Keep existing cached messages on error
-        }
+        },
       }
+    );
 
-      // Clear streaming state
-      clearStreamingState(targetTabId);
-
-      // After streaming completes, process queue if any
-      const queued = getQueueLatest(targetTabId);
-      if (queued.length > 0) {
-        clearQueue(targetTabId);
-        const combinedMessage = queued.join('\n\n---\n\n');
-        setTimeout(() => handleSendMessage(combinedMessage), 100);
-      }
-    } catch (error) {
-      console.error('Failed to send message:', error);
-      // Clear streaming state on error
-      clearStreamingState(targetTabId);
-    }
+    wsRef.current = ws;
   }, [activeTab, workDir, setMessages, addToQueue, getQueueLatest, clearQueue, setSessionMetadata, setTabSession, setPendingUserMessage, setStreamingContent, clearStreamingState, hasPendingMessage]);
 
   // Clear queue handler
@@ -577,7 +686,7 @@ export default function App() {
 
   // Tab handlers
   const handleAddTab = useCallback(() => {
-    const newTab = createTab();
+    createTab();
     // New tab will be at the end, update URL to point to it
     const newIndex = tabs.length; // Current length = new index after adding
     setUrlTabIndex(newIndex, false);
@@ -611,21 +720,32 @@ export default function App() {
     setActiveTabId(tabId);
   }, [tabs, setUrlTabIndex, setActiveTabId]);
 
-  const handleInterrupt = useCallback(async () => {
-    if (activeTab?.sessionId) {
-      await serverApi.interruptProcess(activeTab.sessionId);
+  const handleInterrupt = useCallback(() => {
+    console.log('[Interrupt] Called, wsRef:', !!wsRef.current, 'sessionId:', activeTab?.sessionId);
+    if (wsRef.current) {
+      console.log('[Interrupt] Using WebSocket interrupt');
+      wsRef.current.interrupt();
+    } else if (activeTab?.sessionId) {
+      // Fallback to REST API if no active WebSocket (e.g., broadcast receiver)
+      console.log('[Interrupt] Using REST API interrupt for session:', activeTab.sessionId);
+      serverApi.interruptProcess(activeTab.sessionId);
     }
   }, [activeTab]);
 
-  const handleNewSession = useCallback(() => {
-    if (activeTab) {
-      // Clear session from tab
-      setTabSession(activeTab.id, '');
+  const handleNewSession = useCallback((path?: string) => {
+    // If path provided, set it as the work directory for new sessions
+    if (path) {
+      setNewSessionWorkDir(path);
+      localStorageApi.saveLastWorkDir(path);
     }
+    // Create a new tab for the new session
+    createTab();
+    const newIndex = tabs.length;
+    setUrlTabIndex(newIndex, false);
     setShowWelcome(true);
-  }, [activeTab, setTabSession]);
+  }, [tabs.length, createTab, setUrlTabIndex]);
 
-  // Session selection with 1:1 constraint
+  // Session selection - switch to existing tab or set session on current tab
   const handleSessionSelect = useCallback((selectedSessionId: string, projectPath: string, firstPrompt?: string) => {
     if (!activeTab) return;
 
@@ -634,19 +754,49 @@ export default function App() {
     if (existingTab && existingTab.id !== activeTab.id) {
       // Session already open - switch to that tab
       setActiveTabId(existingTab.id);
+      const existingTabIndex = tabs.findIndex(t => t.id === existingTab.id);
+      if (existingTabIndex >= 0) {
+        setUrlTabIndex(existingTabIndex, false);
+      }
       setShowSessionList(false);
       return;
     }
 
-    // Set session on current tab
+    // Set session on current tab (messages loaded via sessionId-based cache)
     setTabSession(activeTab.id, selectedSessionId);
-
-    // Set workDir and firstPrompt metadata
     setSessionMetadata(selectedSessionId, { workDir: projectPath, firstPrompt });
 
     setShowWelcome(false);
     setShowSessionList(false);
-  }, [activeTab, setTabSession, setSessionMetadata, setActiveTabId, findTabBySession]);
+  }, [activeTab, tabs, setTabSession, setSessionMetadata, setActiveTabId, findTabBySession, setUrlTabIndex]);
+
+  // Open session in a new tab (always creates new tab)
+  const handleOpenInNewTab = useCallback((selectedSessionId: string, projectPath: string, firstPrompt?: string) => {
+    // Check if session is already open
+    const existingTab = findTabBySession(selectedSessionId);
+    if (existingTab) {
+      // Session already open - switch to that tab
+      setActiveTabId(existingTab.id);
+      const existingTabIndex = tabs.findIndex(t => t.id === existingTab.id);
+      if (existingTabIndex >= 0) {
+        setUrlTabIndex(existingTabIndex, false);
+      }
+      setShowSessionList(false);
+      return;
+    }
+
+    // Create new tab with session
+    const newTab = createTab();
+    setTabSession(newTab.id, selectedSessionId);
+    setSessionMetadata(selectedSessionId, { workDir: projectPath, firstPrompt });
+
+    // Switch to the new tab
+    const newTabIndex = tabs.length;
+    setUrlTabIndex(newTabIndex, false);
+
+    setShowWelcome(false);
+    setShowSessionList(false);
+  }, [tabs, createTab, setTabSession, setSessionMetadata, setActiveTabId, findTabBySession, setUrlTabIndex]);
 
   const handleDirectorySelect = useCallback((path: string) => {
     // Update workDir for new sessions and save to localStorage
@@ -677,9 +827,9 @@ export default function App() {
       className="bg-bg-primary flex flex-col overflow-hidden"
       style={{ height: viewportHeight ? `${viewportHeight}px` : '100dvh' }}
     >
-      {/* Header */}
+      {/* Global Header */}
       <header className="shrink-0 bg-bg-secondary border-b border-border">
-        <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-bg-secondary">
+        <div className="flex items-center justify-between px-4 h-10 border-b border-border bg-bg-secondary">
           <div className="flex items-center gap-3">
             {/* Apple-style window buttons */}
             <div className="flex items-center gap-1.5" title={`Server: ${serverHealth}`}>
@@ -690,7 +840,8 @@ export default function App() {
             <span className="text-accent-claude font-bold tracking-wider text-sm">CLAUDE</span>
             <span className="text-text-secondary text-xs">v2.0</span>
           </div>
-          <div className="flex items-center gap-2">
+          {/* FILES button - mobile only */}
+          <div className="flex items-center gap-2 md:hidden">
             <button
               onClick={() => setShowFileExplorer(true)}
               className="flex items-center gap-1.5 px-2 py-1 text-xs text-text-secondary hover:text-accent-claude border border-border hover:border-accent-claude transition-colors"
@@ -700,116 +851,161 @@ export default function App() {
             </button>
           </div>
         </div>
-        {/* Tabs */}
-        <div className="flex items-center gap-0 px-2 py-1 overflow-x-auto scrollbar-hide bg-bg-primary border-b border-border">
-          {tabs.map((tab, index) => {
-            const tabMessages = messageCache.get(tab.sessionId) || [];
-            const firstUserMsg = tabMessages.find((m) => m.type === 'user');
-            const metadata = tab.sessionId ? sessionMetadata.get(tab.sessionId) : undefined;
-            const tabSessionState = tab.sessionId ? getSessionState(tab.sessionId) : undefined;
-            let tabTitle = firstUserMsg
-              ? (firstUserMsg.content as string).slice(0, 25) + ((firstUserMsg.content as string).length > 25 ? '...' : '')
-              : metadata?.firstPrompt
-                ? metadata.firstPrompt.slice(0, 25) + (metadata.firstPrompt.length > 25 ? '...' : '')
-                : tab.sessionId
-                  ? 'session'
-                  : 'new';
-
-            const isActive = tab.id === activeTabId;
-            const tabIsLoading = tabSessionState?.isLoading || false;
-            return (
-              <div
-                key={tab.id}
-                onClick={() => handleTabClick(tab.id)}
-                className={`group flex items-center gap-2 px-3 py-1.5 cursor-pointer text-xs whitespace-nowrap shrink-0 border-r border-border transition-all ${
-                  isActive
-                    ? 'bg-bg-tertiary text-accent-claude border-b-2 border-b-accent-claude -mb-px'
-                    : 'text-text-secondary hover:text-text-primary hover:bg-bg-secondary'
-                }`}
-              >
-                <span className="text-text-secondary">[{index}]</span>
-                <span className="max-w-40 truncate">
-                  {tabIsLoading && '⏳ '}
-                  {tabTitle}
-                </span>
-                <button
-                  onClick={(e) => { e.stopPropagation(); handleCloseTab(tab.id); }}
-                  className={`transition-all ${
-                    isActive
-                      ? 'text-accent-red/70 hover:text-accent-red'
-                      : 'opacity-0 group-hover:opacity-100 text-text-secondary hover:text-accent-red'
-                  }`}
-                >
-                  <X className="w-3 h-3" />
-                </button>
-              </div>
-            );
-          })}
-          <button
-            onClick={handleAddTab}
-            className="flex items-center justify-center px-3 py-1.5 text-text-secondary hover:text-accent-green transition-all shrink-0 text-xs"
-          >
-            [+]
-          </button>
-        </div>
       </header>
 
-      {showWelcome ? (
-        <div className="flex-1 flex flex-col items-center justify-center px-4 py-8">
-          <div className="w-full max-w-lg border border-border bg-bg-secondary">
-            <div className="flex items-center gap-2 px-3 py-2 border-b border-border bg-bg-tertiary">
-              <span className="text-accent-red text-xs">●</span>
-              <span className="text-accent-orange text-xs">●</span>
-              <span className="text-accent-green text-xs">●</span>
-              <span className="text-text-secondary text-xs ml-2">claude-code — bash</span>
-            </div>
-            <div className="p-4 space-y-4">
-              <div className="text-text-secondary text-sm">
-                <span className="text-accent-green">$</span> claude --version
-              </div>
-              <div className="text-text-primary">
-                <span className="text-accent-claude font-bold">CLAUDE CODE</span> <span className="text-text-secondary">v2.0.0</span>
-              </div>
-              <div className="text-text-secondary text-sm">
-                <span className="text-accent-green">$</span> pwd
-              </div>
-              <div className="text-accent-green text-sm">{displayPath}</div>
-              <div className="text-text-secondary text-sm mt-6">
-                <span className="text-accent-green">$</span> Select an action:
-              </div>
-              <div className="space-y-2 mt-2">
-                <button
-                  onClick={() => setShowWelcome(false)}
-                  className="w-full flex items-center gap-3 px-4 py-2.5 text-sm border border-accent-claude text-accent-claude hover:bg-accent-claude hover:text-bg-primary transition-colors text-left"
+      {/* Main area: Sidebar + Content */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* Sidebar - desktop only */}
+        <Sidebar
+          isCollapsed={sidebarCollapsed}
+          onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
+          width={sidebarWidth}
+          onWidthChange={setSidebarWidth}
+          activePanel={sidebarPanel}
+          onPanelChange={setSidebarPanel}
+        >
+          {sidebarPanel === 'sessions' && (
+            <SessionListContent
+              onSessionSelect={handleSessionSelect}
+              onOpenInNewTab={handleOpenInNewTab}
+              onNewSession={handleNewSession}
+              openSessionIds={tabs.filter(t => t.sessionId).map(t => t.sessionId)}
+              runningSessionIds={runningSessionIds}
+              compact={true}
+            />
+          )}
+          {sidebarPanel === 'files' && (
+            <FileExplorerContent
+              initialPath={workDir}
+              mode="browse"
+              onFileSelect={handleFileSelect}
+              onDirectorySelect={handleDirectorySelect}
+              onNewSession={handleNewSession}
+              compact={true}
+            />
+          )}
+          {sidebarPanel === 'config' && (
+            <ConfigViewerContent workDir={workDir} compact={true} />
+          )}
+          {sidebarPanel === 'plugins' && (
+            <PluginsViewerContent compact={true} />
+          )}
+          {sidebarPanel === 'mcp' && (
+            <MCPViewerContent workDir={workDir} compact={true} />
+          )}
+        </Sidebar>
+
+        {/* Content area */}
+        <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+          {/* Tabs */}
+          <div className="flex items-center gap-0 px-2 py-1 overflow-x-auto scrollbar-hide bg-bg-primary border-b border-border shrink-0">
+            {tabs.map((tab, index) => {
+              const tabMessages = messageCache.get(tab.sessionId) || [];
+              const firstUserMsg = tabMessages.find((m) => m.type === 'user');
+              const metadata = tab.sessionId ? sessionMetadata.get(tab.sessionId) : undefined;
+              const tabSessionState = tab.sessionId ? getSessionState(tab.sessionId) : undefined;
+              let tabTitle = firstUserMsg
+                ? (firstUserMsg.content as string).slice(0, 25) + ((firstUserMsg.content as string).length > 25 ? '...' : '')
+                : metadata?.firstPrompt
+                  ? metadata.firstPrompt.slice(0, 25) + (metadata.firstPrompt.length > 25 ? '...' : '')
+                  : tab.sessionId
+                    ? 'session'
+                    : 'new';
+
+              const isActive = tab.id === activeTabId;
+              const tabIsLoading = tabSessionState?.isLoading || false;
+              return (
+                <div
+                  key={tab.id}
+                  onClick={() => handleTabClick(tab.id)}
+                  className={`group flex items-center gap-2 px-3 py-1.5 cursor-pointer text-xs whitespace-nowrap shrink-0 border-r border-border transition-all ${
+                    isActive
+                      ? 'bg-bg-tertiary text-accent-claude border-b-2 border-b-accent-claude -mb-px'
+                      : 'text-text-secondary hover:text-text-primary hover:bg-bg-secondary'
+                  }`}
                 >
-                  <span className="text-text-secondary">[1]</span>
-                  <span>NEW_SESSION</span>
-                </button>
-                <button
-                  onClick={() => setShowSessionList(true)}
-                  className="w-full flex items-center gap-3 px-4 py-2.5 text-sm border border-border text-text-primary hover:border-accent-claude transition-colors text-left"
-                >
-                  <span className="text-text-secondary">[2]</span>
-                  <span>OPEN_SESSION</span>
-                </button>
-                <button
-                  onClick={() => setShowDirectoryPicker(true)}
-                  className="w-full flex items-center gap-3 px-4 py-2.5 text-sm border border-border text-text-primary hover:border-accent-claude transition-colors text-left"
-                >
-                  <span className="text-text-secondary">[3]</span>
-                  <span>CHANGE_DIR</span>
-                </button>
+                  <span className="text-text-secondary">[{index}]</span>
+                  <span className="max-w-40 truncate">
+                    {tabIsLoading && '⏳ '}
+                    {tabTitle}
+                  </span>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); handleCloseTab(tab.id); }}
+                    className={`transition-all ${
+                      isActive
+                        ? 'text-accent-red/70 hover:text-accent-red'
+                        : 'opacity-0 group-hover:opacity-100 text-text-secondary hover:text-accent-red'
+                    }`}
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              );
+            })}
+            <button
+              onClick={handleAddTab}
+              className="flex items-center justify-center px-3 py-1.5 text-text-secondary hover:text-accent-green transition-all shrink-0 text-xs"
+            >
+              [+]
+            </button>
+          </div>
+
+          {showWelcome ? (
+          <div className="flex-1 flex flex-col items-center justify-center px-4 py-8">
+            <div className="w-full max-w-lg border border-border bg-bg-secondary">
+              <div className="flex items-center gap-2 px-3 py-2 border-b border-border bg-bg-tertiary">
+                <span className="text-accent-red text-xs">●</span>
+                <span className="text-accent-orange text-xs">●</span>
+                <span className="text-accent-green text-xs">●</span>
+                <span className="text-text-secondary text-xs ml-2">claude-code — bash</span>
+              </div>
+              <div className="p-4 space-y-4">
+                <div className="text-text-secondary text-sm">
+                  <span className="text-accent-green">$</span> claude --version
+                </div>
+                <div className="text-text-primary">
+                  <span className="text-accent-claude font-bold">CLAUDE CODE</span> <span className="text-text-secondary">v2.0.0</span>
+                </div>
+                <div className="text-text-secondary text-sm">
+                  <span className="text-accent-green">$</span> pwd
+                </div>
+                <div className="text-accent-green text-sm">{displayPath}</div>
+                <div className="text-text-secondary text-sm mt-6">
+                  <span className="text-accent-green">$</span> Select an action:
+                </div>
+                <div className="space-y-2 mt-2">
+                  <button
+                    onClick={() => setShowWelcome(false)}
+                    className="w-full flex items-center gap-3 px-4 py-2.5 text-sm border border-accent-claude text-accent-claude hover:bg-accent-claude hover:text-bg-primary transition-colors text-left"
+                  >
+                    <span className="text-text-secondary">[1]</span>
+                    <span>NEW_SESSION</span>
+                  </button>
+                  <button
+                    onClick={() => setShowSessionList(true)}
+                    className="w-full flex items-center gap-3 px-4 py-2.5 text-sm border border-border text-text-primary hover:border-accent-claude transition-colors text-left"
+                  >
+                    <span className="text-text-secondary">[2]</span>
+                    <span>OPEN_SESSION</span>
+                  </button>
+                  <button
+                    onClick={() => setShowDirectoryPicker(true)}
+                    className="w-full flex items-center gap-3 px-4 py-2.5 text-sm border border-border text-text-primary hover:border-accent-claude transition-colors text-left md:hidden"
+                  >
+                    <span className="text-text-secondary">[3]</span>
+                    <span>CHANGE_DIR</span>
+                  </button>
+                </div>
               </div>
             </div>
           </div>
-        </div>
-      ) : (
-        <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-          <ChatContainer messages={messages} isLoading={isLoading} />
-          <ChatInput
-            onSend={handleSendMessage}
-            onInterrupt={handleInterrupt}
-            isLoading={isLoading}
+        ) : (
+          <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+            <ChatContainer messages={messages} isLoading={isLoading} />
+            <ChatInput
+              onSend={handleSendMessage}
+              onInterrupt={handleInterrupt}
+              isLoading={isLoading}
             workDir={workDir}
             queueCount={queuedMessages.length}
             queuedMessages={queuedMessages}
@@ -822,15 +1018,19 @@ export default function App() {
             onOpenHistory={() => setShowSessionList(true)}
             onClearQueue={handleClearQueue}
           />
+          </div>
+        )}
         </div>
-      )}
+      </div>
 
       <SessionList
         isOpen={showSessionList}
         onClose={() => setShowSessionList(false)}
         onSessionSelect={handleSessionSelect}
+        onOpenInNewTab={handleOpenInNewTab}
         onNewSession={handleNewSession}
         openSessionIds={tabs.filter(t => t.sessionId).map(t => t.sessionId)}
+        runningSessionIds={runningSessionIds}
       />
 
       <FileExplorer

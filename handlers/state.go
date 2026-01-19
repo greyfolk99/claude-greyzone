@@ -110,6 +110,43 @@ func (sm *StateManager) removeClient(id string) {
 
 // GetState returns a copy of current state with synced process info
 func (sm *StateManager) getState() AppState {
+	// First, get a snapshot of active processes (lock order: processLock first)
+	processLock.RLock()
+	activeProcessSnapshot := make(map[int]bool)
+	for pid := range activeProcesses {
+		activeProcessSnapshot[pid] = true
+	}
+	processLock.RUnlock()
+
+	// Now check for stale sessions with state lock
+	sm.mu.Lock()
+	sessionsToClean := []string{}
+	for sessionId, session := range sm.state.Sessions {
+		if session.ProcessID != nil {
+			if !activeProcessSnapshot[*session.ProcessID] {
+				// Process finished but state wasn't updated - fix it now
+				session.IsLoading = false
+				session.ProcessID = nil
+				// Mark for cleanup if no longer needed
+				if !session.IsLoading {
+					sessionsToClean = append(sessionsToClean, sessionId)
+				}
+			}
+		}
+	}
+	// Clean up stale sessions
+	for _, sessionId := range sessionsToClean {
+		delete(sm.state.Sessions, sessionId)
+	}
+	needsBroadcast := len(sessionsToClean) > 0
+	sm.mu.Unlock()
+
+	// Broadcast if we cleaned up stale sessions
+	if needsBroadcast {
+		go sm.broadcast()
+	}
+
+	// Now return a copy
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
@@ -118,23 +155,11 @@ func (sm *StateManager) getState() AppState {
 		Version:  sm.state.Version,
 	}
 
-	// Copy sessions and sync loading state with actual process state
 	for sessionId, session := range sm.state.Sessions {
 		sessionCopy := &SessionState{
 			SessionID: session.SessionID,
 			IsLoading: session.IsLoading,
 			ProcessID: session.ProcessID,
-		}
-		// If session has a processId, verify it's still running
-		if session.ProcessID != nil {
-			processLock.RLock()
-			_, stillRunning := activeProcesses[*session.ProcessID]
-			processLock.RUnlock()
-			if !stillRunning {
-				// Process finished but state wasn't updated - fix it
-				sessionCopy.IsLoading = false
-				sessionCopy.ProcessID = nil
-			}
 		}
 		stateCopy.Sessions[sessionId] = sessionCopy
 	}
@@ -271,16 +296,21 @@ func SetSessionProcessID(sessionId string, processID *int) {
 }
 
 func IsSessionLoading(sessionId string) bool {
+	// Get snapshot of active processes first (lock order: processLock before sm.mu)
+	processLock.RLock()
+	activeProcessSnapshot := make(map[int]bool)
+	for pid := range activeProcesses {
+		activeProcessSnapshot[pid] = true
+	}
+	processLock.RUnlock()
+
 	session := stateManager.getSessionState(sessionId)
 	if session == nil {
 		return false
 	}
 	// If session has a processId, verify it's still actually running
 	if session.IsLoading && session.ProcessID != nil {
-		processLock.RLock()
-		_, stillRunning := activeProcesses[*session.ProcessID]
-		processLock.RUnlock()
-		if !stillRunning {
+		if !activeProcessSnapshot[*session.ProcessID] {
 			// Process finished but state wasn't updated - fix it now
 			stateManager.setSessionLoading(sessionId, false)
 			stateManager.setSessionProcessID(sessionId, nil)

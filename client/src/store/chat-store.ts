@@ -199,6 +199,7 @@ export type WSMessageHandler = {
   onData: (data: string) => void;
   onError: (message: string) => void;
   onDone: () => void;
+  onInterrupted?: (message: string) => void;
   onInputRequest?: (data: unknown) => void;
   onProcessId?: (processId: number) => void;
 };
@@ -232,6 +233,9 @@ export function createChatWebSocket(
           break;
         case 'done':
           handlers.onDone();
+          break;
+        case 'interrupted':
+          handlers.onInterrupted?.(msg.message);
           break;
         case 'inputRequest':
           handlers.onInputRequest?.(msg.data);
@@ -278,6 +282,65 @@ export function createChatWebSocket(
     close: () => {
       ws.close();
     },
+  };
+}
+
+// Session broadcast subscription handler types
+type SessionBroadcastHandler = {
+  onUserPrompt?: (sessionId: string, prompt: string) => void;
+  onData?: (data: string) => void;
+  onDone?: () => void;
+  onInterrupted?: (message: string) => void;
+  onError?: (message: string) => void;
+};
+
+// Subscribe to session broadcasts (for watching other users' activity)
+export function subscribeToSession(
+  sessionId: string,
+  handlers: SessionBroadcastHandler
+): { close: () => void } {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${protocol}//${window.location.host}/api/chat/ws`);
+
+  ws.onopen = () => {
+    // Subscribe to session
+    ws.send(JSON.stringify({
+      type: 'subscribe',
+      payload: { sessionId },
+    }));
+  };
+
+  ws.onmessage = (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      switch (msg.type) {
+        case 'userPrompt':
+          handlers.onUserPrompt?.(msg.sessionId, msg.prompt);
+          break;
+        case 'data':
+          handlers.onData?.(msg.data);
+          break;
+        case 'done':
+          handlers.onDone?.();
+          break;
+        case 'interrupted':
+          handlers.onInterrupted?.(msg.message);
+          break;
+        case 'error':
+          handlers.onError?.(msg.message);
+          break;
+      }
+    } catch (e) {
+      console.error('[SessionWS] Parse error:', e);
+    }
+  };
+
+  ws.onerror = (err) => {
+    console.error('[SessionWS] Error:', err);
+  };
+
+  return {
+    close: () => ws.close(),
   };
 }
 

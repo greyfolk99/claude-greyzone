@@ -131,6 +131,7 @@ func ChatInteractive(c *gin.Context) {
 // InterruptChat handles interrupting an active chat process
 func InterruptChat(c *gin.Context) {
 	sessionID := c.Query("sessionId")
+	log.Printf("[InterruptChat] Called with sessionId=%s", sessionID)
 
 	if sessionID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "sessionId is required"})
@@ -143,6 +144,7 @@ func InterruptChat(c *gin.Context) {
 	// Find by session ID
 	processLock.RLock()
 	for pid, info := range activeProcesses {
+		log.Printf("[InterruptChat] Checking process %d: sessionID=%s", pid, info.SessionID)
 		if info.SessionID == sessionID {
 			processID = pid
 			cmd = info.Cmd
@@ -152,19 +154,29 @@ func InterruptChat(c *gin.Context) {
 	processLock.RUnlock()
 
 	if cmd == nil {
+		log.Printf("[InterruptChat] Process not found for session %s", sessionID)
 		c.JSON(http.StatusNotFound, gin.H{"error": "process not found"})
 		return
 	}
 
+	log.Printf("[InterruptChat] Found process %d, killing...", processID)
+
 	// Kill the process
 	if cmd.Process != nil {
 		if err := cmd.Process.Kill(); err != nil {
+			log.Printf("[InterruptChat] Failed to kill process: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to kill process: %v", err)})
 			return
 		}
+		log.Printf("[InterruptChat] Process killed successfully")
 	}
 
 	unregisterProcess(processID)
+
+	// Update session state to not loading
+	SetSessionLoading(sessionID, false)
+	SetSessionProcessID(sessionID, nil)
+
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
