@@ -22,7 +22,6 @@ func main() {
 	// Parse command line arguments
 	port := flag.Int("port", 43210, "Server port")
 	logDir := flag.String("log-dir", "./logs", "Log directory")
-	localOnly := flag.Bool("local", true, "Bind to localhost only (default: true)")
 	flag.Parse()
 
 	// Setup logging to file
@@ -90,13 +89,8 @@ func main() {
 		c.File("./client/dist/index.html")
 	})
 
-	// Create HTTPS server
-	var addr string
-	if *localOnly {
-		addr = fmt.Sprintf("127.0.0.1:%d", *port)
-	} else {
-		addr = fmt.Sprintf(":%d", *port)
-	}
+	// Create HTTPS server (localhost only for security)
+	addr := fmt.Sprintf("127.0.0.1:%d", *port)
 	server := &http.Server{
 		Addr:    addr,
 		Handler: router,
