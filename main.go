@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -160,10 +161,21 @@ func loggingMiddleware() gin.HandlerFunc {
 	}
 }
 
-// corsMiddleware handles CORS
+// corsMiddleware handles CORS with origin validation
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := c.Request.Header.Get("Origin")
+
+		// Allow requests with no origin (same-origin, curl, etc.)
+		// Or validate that origin is from localhost/127.0.0.1/Tailscale IPs
+		if origin != "" && !isAllowedOrigin(origin) {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
+
+		if origin != "" {
+			c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+		}
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE, PATCH")
@@ -175,6 +187,31 @@ func corsMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+// isAllowedOrigin checks if the origin is from trusted sources
+func isAllowedOrigin(origin string) bool {
+	// Allow localhost variants
+	allowedPrefixes := []string{
+		"http://localhost",
+		"https://localhost",
+		"http://127.0.0.1",
+		"https://127.0.0.1",
+		"http://[::1]",
+		"https://[::1]",
+	}
+	for _, prefix := range allowedPrefixes {
+		if strings.HasPrefix(origin, prefix) {
+			return true
+		}
+	}
+
+	// Allow Tailscale IPs (100.x.x.x range)
+	if strings.Contains(origin, "://100.") {
+		return true
+	}
+
+	return false
 }
 
 // healthCheck returns server health status

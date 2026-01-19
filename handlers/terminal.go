@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -16,14 +17,42 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// checkTerminalOrigin validates WebSocket origin for terminal connections
+func checkTerminalOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	// Allow requests with no Origin (same-origin or non-browser clients)
+	if origin == "" {
+		return true
+	}
+
+	// Allow localhost variants
+	allowedPrefixes := []string{
+		"http://localhost",
+		"https://localhost",
+		"http://127.0.0.1",
+		"https://127.0.0.1",
+		"http://[::1]",
+		"https://[::1]",
+	}
+	for _, prefix := range allowedPrefixes {
+		if strings.HasPrefix(origin, prefix) {
+			return true
+		}
+	}
+
+	// Allow Tailscale IPs (100.x.x.x range)
+	if strings.Contains(origin, "://100.") {
+		return true
+	}
+
+	log.Printf("[Terminal WS] Rejected connection from origin: %s", origin)
+	return false
+}
+
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		// Allow all origins for development
-		// In production, restrict this to your domain
-		return true
-	},
+	CheckOrigin:     checkTerminalOrigin,
 }
 
 // ResizeMessage represents a terminal resize message
